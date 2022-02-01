@@ -276,6 +276,15 @@ typedef struct ts2shout_channel_s {
 	uint32_t buf_size;		// Usable size of MPEG Audio Buffer
 	uint32_t buf_used;		// Amount of buffer used
 	int payload_size;		// Size of the payload
+
+	/* LATM packet management */
+	int latm_new_pkt;
+	uint8_t * latm_buf;
+	uint8_t * latm_buf_ptr;
+	uint32_t latm_buf_used;
+	size_t latm_len_rem;
+	size_t latm_pkt_len;
+
 } ts2shout_channel_t;
 
 /* An internal buffer for handling ffmpegs libavcodec parser data */
@@ -308,6 +317,7 @@ typedef struct programm_info_s {
 	char *programme;                    /* the environment variable PROGRAMMNO (no hassling arround with REDIRECT_ ) */
 	uint8_t	want_ac3;                   /* do we want AC-3 output */
 	uint8_t prefer_rds;                 /* do we prefer RDS  - instead of EPG? (only if there is RDS) */
+	uint8_t want_adts;                  /* do we want AAC audio always in ADTS format? (convert LATM) */
 	uint8_t found_rds;                  /* We found RDS, don't use EIT any longer */
 	uint16_t transport_stream_id;       /* The transport stream id of the wanted programm stream (important for EIT/SDT scan) */
 	enum_stream_type stream_type;       /* The type of transport stream (abstract), fetch from PAT/PMT */

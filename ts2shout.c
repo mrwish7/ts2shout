@@ -87,6 +87,10 @@ static void parse_args(int argc, char **argv)
 		if (strcmp("rds", argv[i]) == 0) {
 			global_state->prefer_rds = 1;
 		}
+		if (strcmp("aac_adts", argv[i]) == 0) {
+			output_logmessage("LATM to ADTS conversion mode.\n");
+			global_state->want_adts = 1;
+		}
 	}
 }
 
@@ -440,6 +444,9 @@ static void add_payload_from_pmt(audio_quality_t * stream_quality, unsigned char
 	if ( audio_all_checks == AUDIO_STREAM ) {
 		global_state->service_id = PMT_PROGRAM_NUMBER(start);
 		global_state->mime_type = mime_type(global_state->stream_type);
+		if ( strcmp(global_state->mime_type, "audio/aacp") == 0 && global_state->want_adts ) {
+			global_state->mime_type = "audio/aac";
+		}
 		global_state->payload_added = 1;
 		output_logmessage("add_payload_from_pmt(): Found %s audio stream in PID %d (service_id %d)\n", stream_quality->stream_type_name, PMT_PID(stream_quality->ptr), global_state->service_id);
 		add_channel(CHANNEL_TYPE_PAYLOAD, PMT_PID(stream_quality->ptr));
@@ -1198,24 +1205,46 @@ static void aac_decode(AVCodecContext *dec_ctx, AVPacket *pkt, AVFrame *frame) {
 }
 #endif
 
+size_t latm_packet_length( const unsigned char *buf ) {
+	size_t latm_pkt_len = ((buf[1] & 0x1f) << 8) | buf[2];
+	return latm_pkt_len;
+}
+
+void latm_validate( const unsigned char *buf, size_t latm_len ) {
+	if (((buf[0] << 3) | (buf[1] >> 5)) == 0x2b7) {
+ 		output_logmessage("LATM sync byte in wrong place!\n");
+ 	}
+	return;
+}
+
+void latm_to_adts( const unsigned char *l_buf, unsigned char *o_buf, size_t flen) {
+	uint32_t counter = 0;
+	while (counter <= flen ) {
+		char shifted_byte = (((l_buf[counter+10] & 0x7)<<5) | (l_buf[counter+11]>>3));
+		memcpy(o_buf + counter, &shifted_byte, 1);
+		counter += 1;
+	}
+	return;
+}
+
+size_t latm_aac_framelen( const unsigned char *buf) {
+	size_t aac_len = (((buf[8] & 0x7)<<5) |
+			 (buf[9]>>3)) +
+			 (((buf[9] & 0x7)<<5) |
+			 (buf[10]>>3));
+			 //output_logmessage("Sync byte: %#x AAC frame length: %lu ES chunk size: %lu\n", buf[0], latm_len, es_len);
+			 return aac_len;
+}
+
 int32_t extract_pes_payload( unsigned char *pes_ptr, size_t pes_len, ts2shout_channel_t *chan, int start_of_pes )
 {
 	unsigned char* es_ptr=NULL;
 	size_t es_len=0;
 	int32_t bytes_written = 0;
-#ifdef FFMPEG
-	int ret;
-	static size_t data_size = 0;
-	static unsigned char data_base[STR_BUF_SIZE];
-	static unsigned char* data = data_base;
-#endif
 	/* Start of audio block / PES? */
 	if ( start_of_pes ) {
 		/* Parse and remove PES header */
 		es_ptr = parse_pes( pes_ptr, pes_len, &es_len, chan );
-#if 0
-		fprintf(stderr, "extract_pes_payload new frame: Frame#%lu, chan->pes_remaining = %ld\n", frame_count, chan->pes_remaining);
-#endif
 	} else if (chan->pes_stream_id) {
 		// Don't output any data until we have seen a PES header
 		es_ptr = pes_ptr;
@@ -1228,43 +1257,8 @@ int32_t extract_pes_payload( unsigned char *pes_ptr, size_t pes_len, ts2shout_ch
 			es_len=chan->pes_remaining;
 		}
 	}
-#ifdef FFMPEG
-	if (global_state->aac_inline_rds && chan->synced ) {
-		// fprintf(stderr, "Filling Offset: %ld, Buffer-size: %ld\n", data - data_base, data_size);
-		memcpy(data, es_ptr, es_len);
-		data = data + es_len;
-		data_size += es_len;
-		/* Process data with ffmpeg */
-		if (! global_state->ffmpeg.decoded_frame) {
-			if (!(global_state->ffmpeg.decoded_frame = av_frame_alloc())) {
-				output_logmessage("ffmpeg(): Could not allocate audio frame\n");
-			}
-		}
-		// DumpHex(data_base, data_size);
-		ret = av_parser_parse2(global_state->ffmpeg.parser, global_state->ffmpeg.c, &global_state->ffmpeg.pkt->data,
-			&global_state->ffmpeg.pkt->size, data_base, data_size, AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
-		// fprintf(stderr, "ffmpeg(): Decoding: data_size=%ld, ret=%d, pkt->size=%d\n", data_size, ret, global_state->ffmpeg.pkt->size);
-		if (ret < 0) {
-			fprintf(stderr, "ffmpeg(): Error while parsing\n");
-		}
-		data = data_base + ret;
-		data_size -= ret;
-		if (global_state->ffmpeg.pkt->size) {
-			aac_decode(global_state->ffmpeg.c, global_state->ffmpeg.pkt, global_state->ffmpeg.decoded_frame);
-		}
-		memmove(data_base, data, data_size);
-		//if (data_size > 0) {
-		//	fprintf(stderr, "---LEFTOVER---\n");
-		// 	DumpHex(data_base, data_size);
-		//}
-		data = data_base + data_size;
-	}
-#endif
 	// Subtract the amount remaining in current PES packet
 	chan->pes_remaining -= es_len;
-#if 0
-		fprintf(stderr, "extract_pes_payload after substraction of current frame: Frame#%lu, chan->pes_remaining = %ld\n", frame_count, chan->pes_remaining);
-#endif
 	// Got some data to write out?
 	if (es_ptr) {
 		// Scan through Elementary Stream (ES)
@@ -1280,6 +1274,9 @@ int32_t extract_pes_payload( unsigned char *pes_ptr, size_t pes_len, ts2shout_ch
 					// output_logmessage("Synced to MP1/MP2 audio in PID %d stream: 0x%x\n", chan->pid, chan->pes_stream_id );
 					mpa_header_print( &chan->mpah );
 					chan->synced = 1;
+					if (global_state->stream_type == STREAM_MODE_AACP) {
+						chan->latm_new_pkt = 1;
+					}
 					chan->payload_size = 2048;
 				}
 			} else {
@@ -1292,13 +1289,22 @@ int32_t extract_pes_payload( unsigned char *pes_ptr, size_t pes_len, ts2shout_ch
 			}
 			if (chan->synced) {
 				// Allocate buffer to store packet in
-				chan->buf_size = chan->payload_size + TS_PACKET_SIZE;
+				chan->buf_size = chan->payload_size + 512;
 				chan->buf = realloc( chan->buf, chan->buf_size + 4 );
 				if (chan->buf==NULL) {
 					output_logmessage("Error: Failed to allocate memory for MPEG Audio buffer\n");
 					exit(-1);
 				}
 				chan->buf_ptr = chan->buf;
+				// Allocate buffer for LATM
+				if (global_state->stream_type == STREAM_MODE_AACP) {
+					chan->latm_buf = realloc( chan->latm_buf, chan->buf_size + 4 );
+					if (chan->latm_buf==NULL) {
+						output_logmessage("Error: Failed to allocate memory for LATM Audio buffer\n");
+						exit(-1);
+					}
+					chan->latm_buf_ptr = chan->latm_buf;
+				}
 				// Initialise the RTP TS to the PES TS
 			} else {
 				// Skip byte
@@ -1306,6 +1312,7 @@ int32_t extract_pes_payload( unsigned char *pes_ptr, size_t pes_len, ts2shout_ch
 				es_ptr++;
 			}
 		}
+
 		// If stream is synced then put data info buffer
 		if (chan->synced && global_state->output_payload) {
 			// Check that there is space
@@ -1313,114 +1320,225 @@ int32_t extract_pes_payload( unsigned char *pes_ptr, size_t pes_len, ts2shout_ch
 				output_logmessage("Error: MPEG Audio buffer overflow\n" );
 				exit(-1);
 			}
-			// Copy data into the buffer
-			memcpy( chan->buf_ptr + chan->buf_used, es_ptr, es_len);
-			chan->buf_used += es_len;
+			// If we have LATM data and we want ADTS, run the converter.
+			if (global_state->stream_type == STREAM_MODE_AACP && global_state->want_adts) {
+				//Create temporary ES buffer.
+				size_t tmp_es_len = es_len;
+				unsigned char tmp_es[tmp_es_len];
+				unsigned char* tmp_es_ptr = tmp_es;
+				memcpy(tmp_es, es_ptr, es_len);
+				//While we have ES data remaining.
+				while (tmp_es_len > 0) {
+					if (chan->latm_new_pkt == 1) {
+						if (tmp_es_len < 3) {
+							memcpy( chan->latm_buf_ptr, tmp_es_ptr, tmp_es_len );
+							chan->latm_buf_ptr += tmp_es_len;
+							chan->latm_pkt_len = tmp_es_len;
+							tmp_es_ptr = tmp_es;
+							tmp_es_len = 0;
+							chan->latm_len_rem = 0;
+							chan->latm_new_pkt = 0;
+						} else {
+							// First three bytes for LATM header
+							size_t header_bytes = 3;
+							memcpy( chan->latm_buf_ptr, tmp_es_ptr, header_bytes);
+							chan->latm_buf_ptr += 3;
+							chan->latm_pkt_len = latm_packet_length( chan->latm_buf );
+							tmp_es_ptr += 3;
+							tmp_es_len -= 3;
+							chan->latm_len_rem = chan->latm_pkt_len;
+							// Now we need latm_pkt_len bytes.
+							if (chan->latm_len_rem > tmp_es_len) {
+								memcpy( chan->latm_buf_ptr, tmp_es_ptr, tmp_es_len );
+								chan->latm_buf_ptr += tmp_es_len;
+								chan->latm_len_rem -= tmp_es_len;
+								tmp_es_ptr = tmp_es;
+								tmp_es_len = 0;
+								chan->latm_new_pkt = 0;
+							} else {
+								memcpy( chan->latm_buf_ptr, tmp_es_ptr, chan->latm_len_rem );
+								chan->latm_buf_ptr += chan->latm_len_rem;
+								tmp_es_ptr += chan->latm_len_rem;
+								tmp_es_len -= chan->latm_len_rem;
+								chan->latm_len_rem = 0;
+							}
+						}
+					} else {
+						// If LATM packet length is under 3, we needed more data.
+						if (chan->latm_pkt_len < 3) {
+							size_t header_left = 3-chan->latm_pkt_len;
+							memcpy(chan->latm_buf_ptr, tmp_es_ptr, header_left);
+							chan->latm_pkt_len = latm_packet_length( chan->latm_buf );
+							tmp_es_ptr += header_left;
+							chan->latm_buf_ptr += header_left;
+							tmp_es_len -= header_left;
+							chan->latm_len_rem = chan->latm_pkt_len;
+						}
+						// Now we need latm_pkt_len bytes.
+						if (chan->latm_len_rem > tmp_es_len) {
+							memcpy( chan->latm_buf_ptr, tmp_es_ptr, tmp_es_len );
+							chan->latm_buf_ptr += tmp_es_len;
+							chan->latm_len_rem -= tmp_es_len;
+							tmp_es_ptr = tmp_es;
+							tmp_es_len = 0;
+						} else {
+							memcpy( chan->latm_buf_ptr, tmp_es_ptr, chan->latm_len_rem );
+							chan->latm_buf_ptr += chan->latm_len_rem;
+							tmp_es_ptr += chan->latm_len_rem;
+							tmp_es_len -= chan->latm_len_rem;
+							chan->latm_len_rem = 0;
+							chan->latm_new_pkt = 1;
+						}
+					}
+
+					// If latm_new_pkt == 1, we have a full LATM packet to copy out.
+					if ( chan->latm_new_pkt == 1 ) {
+						//Get the size of the AAC audio frame within the LATM packet
+						size_t aac_flen = latm_aac_framelen(chan->latm_buf);
+
+						char adts_head_4 = (0xbc | ((aac_flen+7) >> 11));
+						char adts_head_5 = (((aac_flen+7) & 0x7ff) >> 3);
+						char adts_head_6 = ((((aac_flen+7) & 0x7) << 5) | 0x1f);
+
+						char adts_head[] = {0xff, 0xf1, 0x4e, adts_head_4, adts_head_5, adts_head_6, 0xfc};
+						size_t adts_head_size = 7;
+						char* adts_head_ptr = adts_head;
+
+						char adts_body[aac_flen];
+						char* adts_body_ptr = adts_body;
+						uint32_t pad_ctr = 0;
+
+						while (pad_ctr < aac_flen) {
+							adts_body[pad_ctr] =  (((chan->latm_buf[pad_ctr+10] & 0x7)<<5) | (chan->latm_buf[pad_ctr+11]>>3));;
+							pad_ctr += 1;
+						}
+
+						memcpy( chan->buf_ptr + chan->buf_used, adts_head_ptr, adts_head_size );
+						chan->buf_used += adts_head_size;
+						memcpy( chan->buf_ptr + chan->buf_used, adts_body_ptr, aac_flen );
+						chan->buf_used += aac_flen;
+						/**if (! fwrite((char*)chan->buf, chan->buf_used, 1, stdout)) {
+							output_logmessage("write_streamdata: Error or EOF on STDOUT(?) during write.\n");
+				      return -1;
+						}
+						bytes_written += (uint32_t)chan->buf_used;
+						chan->buf_used = 0;**/
+						chan->latm_buf_ptr = chan->latm_buf;
+						chan->latm_pkt_len = 0;
+					}
+				}
+			} else {
+				// Copy data into the buffer
+				memcpy( chan->buf_ptr + chan->buf_used, es_ptr, es_len);
+				chan->buf_used += es_len;
+			}
 		}
 	}
 	/* Okay, actually this doesn't fit very well here, but we want to update the
 	 * cache only if the payload channel is in sync, and we have the SDT ready.
 	 * we have easy access to the sync data here, therefore we access it
 	 * here - Perhaps we can move this elsewhere TODO */
-	if ((!global_state->cache_written) &&
-		global_state->cgi_mode		   &&
-		global_state->sdt_fromstream   &&
-		chan->synced) {
-		add_cache(global_state);
-		global_state->cache_written = 1;
-	}
-	// every time the buffer is full scan for RDS data.
-	// This is MPEG audio only
-	if (chan->buf_used > chan->payload_size
-		&& global_state->output_payload
-		&& ( global_state->stream_type == STREAM_MODE_MPEG ) ) {
-		rds_data_scan(chan);
-	}
-	// Got enough to send packet and we are allowed to output data
-	if (chan->buf_used > chan->payload_size && global_state->output_payload ) {
-		#ifndef DEBUG
-		/* If Icy-MetaData is set to 1 a shoutcast StreamTitle is required all 8192 */
-		/* (SHOUTCAST_METAINT) Bytes */
-		/* see documentation: https://cast.readme.io/docs/icy */
-		if (shoutcast) {
-			if (chan->payload_size + chan->bytes_written_nt <= SHOUTCAST_METAINT) {
-				if (chan->payload_size > 0) {
-					if (! fwrite((char*)chan->buf, chan->payload_size, 1, stdout) ) {
-						if ( ferror(stdout)) {
-							output_logmessage("write_streamdata: Error during write: %s, Exiting.\n", strerror(errno));
-							/* Not ready */
-							return -1;
-						} else {
-							output_logmessage("write_streamdata: EOF on STDOUT(?) during write.\n");
-							return -1;
-						}
-					}
-					chan->bytes_written_nt += chan->payload_size;
-					bytes_written += chan->payload_size;
-				}
-			} else {
-				uint32_t first_write = SHOUTCAST_METAINT - chan->bytes_written_nt;
-				uint32_t second_write = chan->payload_size - first_write;
-				uint16_t bytes = 0;
-				uint16_t written = 0;
-				char streamtitle[STR_BUF_SIZE];
-				/* Only output StreamTitle if it's different or for the first time */
-				if (strcmp(global_state->stream_title, global_state->old_stream_title) != 0) {
-					/* Maximum of 2000 characters! */
-					snprintf(streamtitle, STR_BUF_SIZE - 1, "StreamTitle='%.2000s';", global_state->stream_title);
-					strcpy(global_state->old_stream_title, global_state->stream_title);
-				} else {
-					memset(streamtitle, 0, strlen(global_state->stream_title) + 1);
-				}
-				bytes = ((strlen(streamtitle))>>4) + (strlen(streamtitle) > 0?1:0);
-				/* Shift right by 4 bit => Divide by 16, and add 1 to get minimum possible length.
-				 * Add 1 only, if size is > 0, otherwise there is no metadata and therefore nothing to send */
-				if (first_write > 0) {
-					if (! fwrite((char*)chan->buf, first_write, 1, stdout)) {
-						if (ferror(stdout)) {
-							output_logmessage("write_streamdata: Error during write: %s, Exiting.\n", strerror(errno));
-						} else {
-							output_logmessage("write_streamdata: Error or EOF on STDOUT(?) during write.\n");
-						}
-						return -1;
-					}
-					bytes_written += first_write;
-					chan->bytes_written_nt += first_write;
-				}
-				fwrite(&bytes, 1, 1, stdout);
-				fwrite(streamtitle, bytes<<4, 1, stdout);
-				bytes_written += 1;
-				bytes_written += bytes<<4;
-				if (second_write > 0) {
-					if (! fwrite((char*)(chan->buf + first_write), second_write, 1, stdout) ) {
-						if (ferror(stdout)) {
-							output_logmessage("write_streamdata: Error during write: %s, Exiting.\n", strerror(errno));
-						} else {
-							output_logmessage("write_streamdata: Error or EOF on STDOUT(?) during write.\n");
-						}
-						return -1;
-					}
-					written = second_write;
-					bytes_written += written;
-					/* Reset the Shoutcastcounter */
-					chan->bytes_written_nt = second_write;
-				}
-				fflush(stdout);
-			}
-		} else {
-			if (chan->payload_size > 0 && ! fwrite((char*)chan->buf, chan->payload_size, 1, stdout) ) {
-				output_logmessage("write_streamdata: Error or EOF on STDOUT(?) during write.\n");
-				return -1;
-			}
-			bytes_written += chan->payload_size;
-			chan->bytes_written_nt += chan->payload_size;
-		}
-		#endif
-		// Move any remaining memory to the start of the buffer
-		chan->buf_used -= chan->payload_size;
-		memmove( chan->buf_ptr, chan->buf_ptr+chan->payload_size, chan->buf_used );
+	 if ((!global_state->cache_written) &&
+	   global_state->cgi_mode		   &&
+	   global_state->sdt_fromstream   &&
+	   chan->synced) {
+	   add_cache(global_state);
+	   global_state->cache_written = 1;
+	 }
 
-	}
+	 // every time the buffer is full scan for RDS data.
+	 // This is MPEG audio only
+	 if (chan->buf_used > chan->payload_size
+	   && global_state->output_payload
+	   && ( global_state->stream_type == STREAM_MODE_MPEG ) ) {
+	   rds_data_scan(chan);
+	 }
+	 // Got enough to send packet and we are allowed to output data
+	 if (chan->buf_used > chan->payload_size && global_state->output_payload ) {
+	   #ifndef DEBUG
+	   /* If Icy-MetaData is set to 1 a shoutcast StreamTitle is required all 8192 */
+	   /* (SHOUTCAST_METAINT) Bytes */
+	   /* see documentation: https://cast.readme.io/docs/icy */
+	   if (shoutcast) {
+	     if (chan->payload_size + chan->bytes_written_nt <= SHOUTCAST_METAINT) {
+	       if (chan->payload_size > 0) {
+	         if (! fwrite((char*)chan->buf, chan->payload_size, 1, stdout) ) {
+	           if ( ferror(stdout)) {
+	             output_logmessage("write_streamdata: Error during write: %s, Exiting.\n", strerror(errno));
+	             /* Not ready */
+	             return -1;
+	           } else {
+	             output_logmessage("write_streamdata: EOF on STDOUT(?) during write.\n");
+	             return -1;
+	           }
+	         }
+	         chan->bytes_written_nt += chan->payload_size;
+	         bytes_written += chan->payload_size;
+	       }
+	     } else {
+	       uint32_t first_write = SHOUTCAST_METAINT - chan->bytes_written_nt;
+	       uint32_t second_write = chan->payload_size - first_write;
+	       uint16_t bytes = 0;
+	       uint16_t written = 0;
+	       char streamtitle[STR_BUF_SIZE];
+	       /* Only output StreamTitle if it's different or for the first time */
+	       if (strcmp(global_state->stream_title, global_state->old_stream_title) != 0) {
+	         /* Maximum of 2000 characters! */
+	         snprintf(streamtitle, STR_BUF_SIZE - 1, "StreamTitle='%.2000s';", global_state->stream_title);
+	         strcpy(global_state->old_stream_title, global_state->stream_title);
+	       } else {
+	         memset(streamtitle, 0, strlen(global_state->stream_title) + 1);
+	       }
+	       bytes = ((strlen(streamtitle))>>4) + (strlen(streamtitle) > 0?1:0);
+	       /* Shift right by 4 bit => Divide by 16, and add 1 to get minimum possible length.
+	        * Add 1 only, if size is > 0, otherwise there is no metadata and therefore nothing to send */
+	       if (first_write > 0) {
+	         if (! fwrite((char*)chan->buf, first_write, 1, stdout)) {
+	           if (ferror(stdout)) {
+	             output_logmessage("write_streamdata: Error during write: %s, Exiting.\n", strerror(errno));
+	           } else {
+	             output_logmessage("write_streamdata: Error or EOF on STDOUT(?) during write.\n");
+	           }
+	           return -1;
+	         }
+	         bytes_written += first_write;
+	         chan->bytes_written_nt += first_write;
+	       }
+	       fwrite(&bytes, 1, 1, stdout);
+	       fwrite(streamtitle, bytes<<4, 1, stdout);
+	       bytes_written += 1;
+	       bytes_written += bytes<<4;
+	       if (second_write > 0) {
+	         if (! fwrite((char*)(chan->buf + first_write), second_write, 1, stdout) ) {
+	           if (ferror(stdout)) {
+	             output_logmessage("write_streamdata: Error during write: %s, Exiting.\n", strerror(errno));
+	           } else {
+	             output_logmessage("write_streamdata: Error or EOF on STDOUT(?) during write.\n");
+	           }
+	           return -1;
+	         }
+	         written = second_write;
+	         bytes_written += written;
+	         /* Reset the Shoutcastcounter */
+	         chan->bytes_written_nt = second_write;
+	       }
+	       fflush(stdout);
+	     }
+	   } else {
+	     if (chan->payload_size > 0 && ! fwrite((char*)chan->buf, chan->payload_size, 1, stdout) ) {
+	       output_logmessage("write_streamdata: Error or EOF on STDOUT(?) during write.\n");
+	       return -1;
+	     }
+	     bytes_written += chan->payload_size;
+	     chan->bytes_written_nt += chan->payload_size;
+	   }
+	   #endif
+	   // Move any remaining memory to the start of the buffer
+	   chan->buf_used -= chan->payload_size;
+	   memmove( chan->buf_ptr, chan->buf_ptr+chan->payload_size, chan->buf_used );
+
+	 }
+
 	return bytes_written;
 }
 
@@ -1827,6 +1945,7 @@ int main(int argc, char **argv)
 	/* Are we running as CGI programme? */
 	if (getenv("QUERY_STRING")) {
 		global_state->cgi_mode = 1;
+		global_state->want_adts = 1;
 		if (getenv("MetaData") && strncmp(getenv("MetaData"), "1", 1) == 0) {
 			shoutcast = 1;
 		} else if (getenv("REDIRECT_MetaData") && strncmp(getenv("REDIRECT_MetaData"), "1", 1) == 0) {
@@ -1845,6 +1964,10 @@ int main(int argc, char **argv)
 		}
 		if (getenv("REDIRECT_RDS") && strncmp(getenv("REDIRECT_RDS"), "1", 1) == 0) {
 			global_state->prefer_rds = 1;
+		}
+		if (getenv("AAC_ADTS") && strncmp(getenv("AAC_ADTS"), "1", 1) == 0) {
+			output_logmessage("LATM to ADTS conversion mode.\n");
+			global_state->want_adts = 1;
 		}
 	} else {
 		// Parse command line arguments
@@ -1890,6 +2013,7 @@ int main(int argc, char **argv)
 	// Clean up
 	for (i=0;i<channel_count;i++) {
 		if (channels[i]->buf) free( channels[i]->buf );
+		if (channels[i]->latm_buf) free ( channels[i]->latm_buf );
 		free( channels[i] );
 	}
 	free(dsmcc_table);
@@ -1900,4 +2024,3 @@ int main(int argc, char **argv)
 	}
 	exit(0);
 }
-
